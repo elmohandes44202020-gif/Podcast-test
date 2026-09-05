@@ -1,220 +1,187 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from typing import Optional
 from pathlib import Path
 import edge_tts
 import asyncio
 import subprocess
 import tempfile
-import shutil
 import uuid
 import os
-import zipfile
-import time
+import shutil
 import re
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-APP_NAME = "Edge TTS Audio Processing Server"
-
-BASE_DIR = Path(__file__).resolve().parent
-
-OUTPUT_DIR = BASE_DIR / "outputs"
-TEMP_DIR = BASE_DIR / "temp"
-
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-# الاحتفاظ بالملفات الناتجة لمدة 6 ساعات
-FILE_LIFETIME = 6 * 60 * 60
-
-
-# ============================================================
-# FASTAPI
-# ============================================================
-
 app = FastAPI(
-    title=APP_NAME,
+    title="Edge TTS Audio Processing Server",
     version="2.0.0"
 )
 
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = BASE_DIR / "outputs"
+TEMP_DIR = BASE_DIR / "temp"
+
+OUTPUT_DIR.mkdir(exist_ok=True)
+TEMP_DIR.mkdir(exist_ok=True)
+
 
 # ============================================================
-# JOB STORAGE
-# ============================================================
-
-jobs = {}
-
-
-# ============================================================
-# REQUEST MODELS
+# Models
 # ============================================================
 
 class GenerateRequest(BaseModel):
-
     text: str = Field(..., min_length=1)
-
-    voice: str = "ar-SA-ShakirNeural"
-
+    voice: str = "ar-SA-HamedNeural"
     rate: str = "+0%"
-
     pitch: str = "+0Hz"
-
     output_format: str = "mp3"
-
-    bitrate: int = 128
-
+    bitrate: str = "192k"
     sample_rate: int = 44100
-
     channels: int = 2
 
-    # التقسيم بالدقائق
-    split_minutes: Optional[int] = None
 
-    # أو التقسيم بعدد الأحرف
-    split_chars: Optional[int] = None
+class PodcastSegment(BaseModel):
+    speaker: str
+    text: str = Field(..., min_length=1)
 
-    # إنشاء ZIP
-    create_zip: bool = False
+
+class PodcastRequest(BaseModel):
+    segments: list[PodcastSegment]
+
+    speaker_voices: dict[str, str] = {
+        "speaker1": "ar-SA-HamedNeural",
+        "speaker2": "ar-SA-ZariyahNeural"
+    }
+
+    speaker_rates: dict[str, str] = {}
+    speaker_pitches: dict[str, str] = {}
+
+    output_format: str = "mp3"
+    bitrate: str = "192k"
+    sample_rate: int = 44100
+    channels: int = 2
+
+    silence_ms: int = 300
 
 
 # ============================================================
-# UTILITIES
+# Helpers
 # ============================================================
 
-def sanitize_filename(name: str) -> str:
+def ffmpeg_path():
+    return shutil.which("ffmpeg")
 
-    name = re.sub(r"[^\w\-]+", "_", name)
+
+def validate_format(fmt: str):
+    fmt = fmt.lower()
+
+    if fmt not in ("mp3", "wav"):
+        raise HTTPException(
+            status_code=400,
+            detail="output_format must be mp3 or wav"
+        )
+
+    return fmt
+
+
+def validate_audio_settings(sample_rate: int, channels: int):
+    allowed_rates = {
+        8000,
+        16000,
+        22050,
+        24000,
+        32000,
+        44100,
+        48000
+    }
+
+    if sample_rate not in allowed_rates:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported sample_rate. Allowed: {sorted(allowed_rates)}"
+        )
+
+    if channels not in (1, 2):
+        raise HTTPException(
+            status_code=400,
+            detail="channels must be 1 or 2"
+        )
+
+
+def safe_filename(name: str):
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+    name = name.strip()
 
     if not name:
         name = "audio"
 
-    return name[:80]
-
-
-def ffmpeg_exists():
-
-    try:
-
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
-        )
-
-        return True
-
-    except Exception:
-
-        return False
-
-
-def update_job(job_id, **kwargs):
-
-    if job_id not in jobs:
-        return
-
-    jobs[job_id].update(kwargs)
+    return name
 
 
 # ============================================================
-# EDGE TTS
+# Edge-TTS
 # ============================================================
 
-async def generate_edge_tts(
+async def generate_tts(
     text: str,
     voice: str,
     rate: str,
     pitch: str,
-    output_file: Path,
+    output_file: Path
 ):
-
     communicate = edge_tts.Communicate(
         text=text,
         voice=voice,
         rate=rate,
-        pitch=pitch,
+        pitch=pitch
     )
 
     with open(output_file, "wb") as f:
-
         async for chunk in communicate.stream():
-
             if chunk["type"] == "audio":
-
                 f.write(chunk["data"])
 
 
 # ============================================================
-# FFMPEG PROCESSING
+# FFmpeg processing
 # ============================================================
 
-def process_audio(
+def convert_audio(
     input_file: Path,
     output_file: Path,
     output_format: str,
-    bitrate: int,
+    bitrate: str,
     sample_rate: int,
-    channels: int,
+    channels: int
 ):
+    if not ffmpeg_path():
+        raise RuntimeError("FFmpeg is not installed on the server.")
+
+    command = [
+        ffmpeg_path(),
+        "-y",
+        "-i",
+        str(input_file),
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        str(channels)
+    ]
 
     if output_format == "mp3":
-
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_file),
-
-            "-vn",
-
-            "-ac",
-            str(channels),
-
-            "-ar",
-            str(sample_rate),
-
-            "-b:a",
-            f"{bitrate}k",
-
+        command += [
             "-codec:a",
             "libmp3lame",
-
-            str(output_file)
+            "-b:a",
+            bitrate
         ]
 
     elif output_format == "wav":
-
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_file),
-
-            "-vn",
-
-            "-ac",
-            str(channels),
-
-            "-ar",
-            str(sample_rate),
-
+        command += [
             "-codec:a",
-            "pcm_s16le",
-
-            str(output_file)
+            "pcm_s16le"
         ]
 
-    else:
-
-        raise ValueError(
-            "Unsupported output format"
-        )
+    command.append(str(output_file))
 
     result = subprocess.run(
         command,
@@ -224,130 +191,78 @@ def process_audio(
     )
 
     if result.returncode != 0:
-
         raise RuntimeError(
-            result.stderr[-4000:]
+            "FFmpeg conversion failed:\n" + result.stderr[-4000:]
         )
 
 
-# ============================================================
-# AUDIO DURATION
-# ============================================================
+def create_silence(
+    output_file: Path,
+    milliseconds: int,
+    sample_rate: int,
+    channels: int
+):
+    if milliseconds <= 0:
+        return
 
-def get_audio_duration(file_path: Path):
+    duration = milliseconds / 1000
 
     command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(file_path)
+        ffmpeg_path(),
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"anullsrc=r={sample_rate}:cl={'mono' if channels == 1 else 'stereo'}",
+        "-t",
+        str(duration),
+        "-c:a",
+        "pcm_s16le",
+        str(output_file)
     ]
 
-    try:
-
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        return float(result.stdout.strip())
-
-    except Exception:
-
-        return 0
-
-
-# ============================================================
-# SPLIT AUDIO BY TIME
-# ============================================================
-
-def split_audio_by_time(
-    input_file: Path,
-    output_dir: Path,
-    minutes: int,
-    output_format: str,
-    bitrate: int,
-    sample_rate: int,
-    channels: int,
-):
-
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
     )
 
-    duration = get_audio_duration(
-        input_file
-    )
-
-    if duration <= 0:
-
+    if result.returncode != 0:
         raise RuntimeError(
-            "Unable to determine audio duration"
+            "Could not create silence:\n" + result.stderr[-4000:]
         )
 
-    segment_seconds = minutes * 60
 
-    parts = []
+def concat_audio(
+    files: list[Path],
+    output_file: Path
+):
+    if not files:
+        raise RuntimeError("No audio files to concatenate.")
 
-    start = 0
-    index = 1
+    list_file = output_file.parent / f"{uuid.uuid4().hex}_concat.txt"
 
-    while start < duration:
-
-        output_file = (
-            output_dir /
-            f"part_{index:03d}.{output_format}"
-        )
+    try:
+        with open(list_file, "w", encoding="utf-8") as f:
+            for file in files:
+                path = str(file.resolve())
+                path = path.replace("'", "'\\''")
+                f.write(f"file '{path}'\n")
 
         command = [
-            "ffmpeg",
+            ffmpeg_path(),
             "-y",
-
-            "-ss",
-            str(start),
-
+            "-f",
+            "concat",
+            "-safe",
+            "0",
             "-i",
-            str(input_file),
-
-            "-t",
-            str(segment_seconds),
-
-            "-vn",
-
-            "-ac",
-            str(channels),
-
-            "-ar",
-            str(sample_rate),
-        ]
-
-        if output_format == "mp3":
-
-            command += [
-                "-codec:a",
-                "libmp3lame",
-
-                "-b:a",
-                f"{bitrate}k",
-            ]
-
-        elif output_format == "wav":
-
-            command += [
-                "-codec:a",
-                "pcm_s16le",
-            ]
-
-        command.append(
+            str(list_file),
+            "-c",
+            "copy",
             str(output_file)
-        )
+        ]
 
         result = subprocess.run(
             command,
@@ -357,295 +272,329 @@ def split_audio_by_time(
         )
 
         if result.returncode != 0:
-
             raise RuntimeError(
-                result.stderr[-4000:]
+                "FFmpeg concat failed:\n" + result.stderr[-4000:]
             )
 
-        parts.append(output_file)
-
-        start += segment_seconds
-        index += 1
-
-    return parts
+    finally:
+        list_file.unlink(missing_ok=True)
 
 
 # ============================================================
-# ZIP
+# Health / Root
 # ============================================================
 
-def create_zip(
-    files,
-    zip_file: Path
-):
-
-    with zipfile.ZipFile(
-        zip_file,
-        "w",
-        compression=zipfile.ZIP_DEFLATED
-    ) as z:
-
-        for file in files:
-
-            z.write(
-                file,
-                arcname=file.name
-            )
-
-    return zip_file
-
-
-# ============================================================
-# CLEAN OLD FILES
-# ============================================================
-
-def cleanup_old_files():
-
-    now = time.time()
-
-    for directory in [
-        OUTPUT_DIR,
-        TEMP_DIR
-    ]:
-
-        if not directory.exists():
-            continue
-
-        for item in directory.iterdir():
-
-            try:
-
-                if now - item.stat().st_mtime > FILE_LIFETIME:
-
-                    if item.is_dir():
-
-                        shutil.rmtree(
-                            item,
-                            ignore_errors=True
-                        )
-
-                    else:
-
-                        item.unlink(
-                            missing_ok=True
-                        )
-
-            except Exception:
-
-                pass
+@app.get("/")
+async def root():
+    return {
+        "name": "Edge TTS Audio Processing Server",
+        "status": "online",
+        "edge_tts": True,
+        "ffmpeg": ffmpeg_path() is not None,
+        "formats": ["mp3", "wav"],
+        "bitrates": [56, 64, 96, 128, 192, 256, 320],
+        "features": [
+            "Edge-TTS",
+            "MP3",
+            "WAV",
+            "Bitrate",
+            "Sample Rate",
+            "Mono/Stereo",
+            "Podcast",
+            "Multi Speaker",
+            "Audio Concatenation"
+        ]
+    }
 
 
 # ============================================================
-# MAIN BACKGROUND JOB
+# FFmpeg status
 # ============================================================
 
-async def run_job(
-    job_id: str,
-    request: GenerateRequest
-):
+@app.get("/ffmpeg")
+async def ffmpeg_status():
 
-    work_dir = (
-        TEMP_DIR /
-        job_id
+    path = ffmpeg_path()
+
+    if not path:
+        return {
+            "installed": False,
+            "message": "FFmpeg is not installed."
+        }
+
+    try:
+        result = subprocess.run(
+            [path, "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        first_line = result.stdout.splitlines()[0] \
+            if result.stdout else "Unknown"
+
+        return {
+            "installed": True,
+            "path": path,
+            "version": first_line
+        }
+
+    except Exception as e:
+        return {
+            "installed": True,
+            "error": str(e)
+        }
+
+
+# ============================================================
+# Normal TTS
+# ============================================================
+
+@app.post("/generate")
+async def generate_audio(request: GenerateRequest):
+
+    validate_format(request.output_format)
+
+    validate_audio_settings(
+        request.sample_rate,
+        request.channels
     )
 
-    output_dir = (
-        OUTPUT_DIR /
-        job_id
-    )
+    if not ffmpeg_path():
+        raise HTTPException(
+            status_code=500,
+            detail="FFmpeg is not installed on the server."
+        )
 
-    work_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    job_id = uuid.uuid4().hex
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
+    temp_mp3 = TEMP_DIR / f"{job_id}.mp3"
+
+    filename = safe_filename(f"audio_{job_id}")
+
+    final_file = OUTPUT_DIR / (
+        f"{filename}.{request.output_format}"
     )
 
     try:
 
-        update_job(
-            job_id,
-            status="generating",
-            progress=5
+        await generate_tts(
+            request.text,
+            request.voice,
+            request.rate,
+            request.pitch,
+            temp_mp3
         )
 
+        convert_audio(
+            temp_mp3,
+            final_file,
+            request.output_format,
+            request.bitrate,
+            request.sample_rate,
+            request.channels
+        )
+
+        return {
+            "success": True,
+            "type": "single",
+            "filename": final_file.name,
+            "download_url": f"/download/{final_file.name}"
+        }
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+    finally:
+
+        temp_mp3.unlink(missing_ok=True)
+
+
+# ============================================================
+# Podcast
+# ============================================================
+
+@app.post("/podcast")
+async def generate_podcast(request: PodcastRequest):
+
+    if not request.segments:
+        raise HTTPException(
+            status_code=400,
+            detail="Podcast must contain at least one segment."
+        )
+
+    validate_format(request.output_format)
+
+    validate_audio_settings(
+        request.sample_rate,
+        request.channels
+    )
+
+    if not ffmpeg_path():
+        raise HTTPException(
+            status_code=500,
+            detail="FFmpeg is not installed on the server."
+        )
+
+    job_id = uuid.uuid4().hex
+
+    work_dir = TEMP_DIR / f"podcast_{job_id}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    generated_files = []
+
+    try:
+
         # ----------------------------------------------------
-        # Validate
+        # Generate every dialogue segment separately
         # ----------------------------------------------------
 
-        if not ffmpeg_exists():
+        for index, segment in enumerate(request.segments):
 
-            raise RuntimeError(
-                "FFmpeg is not installed or not available in PATH."
+            speaker = segment.speaker
+
+            voice = request.speaker_voices.get(
+                speaker,
+                "ar-SA-HamedNeural"
             )
 
-        if request.output_format not in [
-            "mp3",
-            "wav"
-        ]:
-
-            raise ValueError(
-                "output_format must be mp3 or wav"
+            rate = request.speaker_rates.get(
+                speaker,
+                "+0%"
             )
 
-        if request.output_format == "mp3":
+            pitch = request.speaker_pitches.get(
+                speaker,
+                "+0Hz"
+            )
 
-            if request.bitrate < 56:
+            segment_mp3 = (
+                work_dir /
+                f"{index:06d}_{speaker}.mp3"
+            )
 
-                request.bitrate = 56
+            await generate_tts(
+                segment.text,
+                voice,
+                rate,
+                pitch,
+                segment_mp3
+            )
 
-            if request.bitrate > 320:
+            generated_files.append(segment_mp3)
 
-                request.bitrate = 320
+            # ------------------------------------------------
+            # Add silence between dialogue segments
+            # ------------------------------------------------
 
-        if request.channels not in [
-            1,
-            2
-        ]:
+            if (
+                request.silence_ms > 0
+                and index < len(request.segments) - 1
+            ):
 
-            request.channels = 2
+                silence_file = (
+                    work_dir /
+                    f"{index:06d}_silence.wav"
+                )
+
+                create_silence(
+                    silence_file,
+                    request.silence_ms,
+                    request.sample_rate,
+                    request.channels
+                )
+
+                generated_files.append(silence_file)
 
         # ----------------------------------------------------
-        # Generate Edge-TTS
+        # Normalize everything to same WAV format
         # ----------------------------------------------------
 
-        raw_file = (
+        normalized_files = []
+
+        for index, file in enumerate(generated_files):
+
+            normalized = (
+                work_dir /
+                f"normalized_{index:06d}.wav"
+            )
+
+            convert_audio(
+                file,
+                normalized,
+                "wav",
+                request.bitrate,
+                request.sample_rate,
+                request.channels
+            )
+
+            normalized_files.append(normalized)
+
+        # ----------------------------------------------------
+        # Concatenate
+        # ----------------------------------------------------
+
+        merged_wav = (
             work_dir /
-            "edge_output.mp3"
+            "podcast_merged.wav"
         )
 
-        await generate_edge_tts(
-            text=request.text,
-            voice=request.voice,
-            rate=request.rate,
-            pitch=request.pitch,
-            output_file=raw_file
-        )
-
-        update_job(
-            job_id,
-            status="processing",
-            progress=55
+        concat_audio(
+            normalized_files,
+            merged_wav
         )
 
         # ----------------------------------------------------
-        # First conversion
+        # Final output
         # ----------------------------------------------------
 
-        processed_file = (
-            work_dir /
-            f"processed.{request.output_format}"
+        final_name = safe_filename(
+            f"podcast_{job_id}"
         )
 
-        process_audio(
-            input_file=raw_file,
-            output_file=processed_file,
-            output_format=request.output_format,
-            bitrate=request.bitrate,
-            sample_rate=request.sample_rate,
-            channels=request.channels
+        final_file = OUTPUT_DIR / (
+            f"{final_name}.{request.output_format}"
         )
 
-        # ----------------------------------------------------
-        # SPLITTING
-        # ----------------------------------------------------
+        if request.output_format == "wav":
 
-        files = []
-
-        if request.split_minutes:
-
-            update_job(
-                job_id,
-                status="splitting",
-                progress=70
-            )
-
-            files = split_audio_by_time(
-                input_file=processed_file,
-                output_dir=output_dir,
-                minutes=request.split_minutes,
-                output_format=request.output_format,
-                bitrate=request.bitrate,
-                sample_rate=request.sample_rate,
-                channels=request.channels
+            convert_audio(
+                merged_wav,
+                final_file,
+                "wav",
+                request.bitrate,
+                request.sample_rate,
+                request.channels
             )
 
         else:
 
-            final_file = (
-                output_dir /
-                f"audio.{request.output_format}"
+            convert_audio(
+                merged_wav,
+                final_file,
+                "mp3",
+                request.bitrate,
+                request.sample_rate,
+                request.channels
             )
 
-            shutil.copy2(
-                processed_file,
-                final_file
-            )
-
-            files = [
-                final_file
-            ]
-
-        # ----------------------------------------------------
-        # ZIP
-        # ----------------------------------------------------
-
-        zip_file = None
-
-        if request.create_zip:
-
-            update_job(
-                job_id,
-                status="creating_zip",
-                progress=90
-            )
-
-            zip_file = (
-                output_dir /
-                "audio_files.zip"
-            )
-
-            create_zip(
-                files,
-                zip_file
-            )
-
-        # ----------------------------------------------------
-        # DONE
-        # ----------------------------------------------------
-
-        update_job(
-            job_id,
-            status="completed",
-            progress=100,
-            files=[
-                str(
-                    file.relative_to(OUTPUT_DIR)
-                )
-                for file in files
-            ],
-            zip_file=(
-                str(
-                    zip_file.relative_to(
-                        OUTPUT_DIR
-                    )
-                )
-                if zip_file
-                else None
-            ),
-            finished_at=time.time()
-        )
+        return {
+            "success": True,
+            "type": "podcast",
+            "segments": len(request.segments),
+            "filename": final_file.name,
+            "download_url": f"/download/{final_file.name}"
+        }
 
     except Exception as e:
 
-        update_job(
-            job_id,
-            status="failed",
-            progress=0,
-            error=str(e)
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
         )
 
     finally:
@@ -657,100 +606,17 @@ async def run_job(
 
 
 # ============================================================
-# CREATE JOB
+# Download
 # ============================================================
 
-@app.post("/generate")
-async def generate(
-    request: GenerateRequest
-):
+@app.get("/download/{filename}")
+async def download_file(filename: str):
 
-    cleanup_old_files()
+    filename = Path(filename).name
 
-    if not request.text.strip():
-
-        raise HTTPException(
-            status_code=400,
-            detail="Text cannot be empty."
-        )
-
-    job_id = str(
-        uuid.uuid4()
-    )
-
-    jobs[job_id] = {
-
-        "job_id": job_id,
-
-        "status": "queued",
-
-        "progress": 0,
-
-        "created_at": time.time(),
-
-        "finished_at": None,
-
-        "error": None,
-
-        "files": [],
-
-        "zip_file": None
-    }
-
-    asyncio.create_task(
-        run_job(
-            job_id,
-            request
-        )
-    )
-
-    return {
-
-        "success": True,
-
-        "job_id": job_id,
-
-        "status": "queued"
-    }
-
-
-# ============================================================
-# JOB STATUS
-# ============================================================
-
-@app.get("/status/{job_id}")
-async def status(
-    job_id: str
-):
-
-    if job_id not in jobs:
-
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found."
-        )
-
-    return jobs[job_id]
-
-
-# ============================================================
-# DOWNLOAD SINGLE FILE
-# ============================================================
-
-@app.get("/download/{job_id}/{filename}")
-async def download_file(
-    job_id: str,
-    filename: str
-):
-
-    file_path = (
-        OUTPUT_DIR /
-        job_id /
-        filename
-    )
+    file_path = OUTPUT_DIR / filename
 
     if not file_path.exists():
-
         raise HTTPException(
             status_code=404,
             detail="File not found."
@@ -758,105 +624,55 @@ async def download_file(
 
     return FileResponse(
         path=str(file_path),
-        filename=file_path.name
+        filename=file_path.name,
+        media_type="application/octet-stream"
     )
 
 
 # ============================================================
-# DOWNLOAD ZIP
+# Cleanup old files
 # ============================================================
 
-@app.get("/download-zip/{job_id}")
-async def download_zip(
-    job_id: str
-):
+@app.post("/cleanup")
+async def cleanup():
 
-    if job_id not in jobs:
+    removed = 0
 
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found."
-        )
+    for file in OUTPUT_DIR.iterdir():
 
-    zip_file = jobs[job_id].get(
-        "zip_file"
-    )
+        if not file.is_file():
+            continue
 
-    if not zip_file:
+        try:
+            file.unlink()
+            removed += 1
 
-        raise HTTPException(
-            status_code=404,
-            detail="ZIP file was not created."
-        )
-
-    file_path = (
-        OUTPUT_DIR /
-        zip_file
-    )
-
-    if not file_path.exists():
-
-        raise HTTPException(
-            status_code=404,
-            detail="ZIP file not found."
-        )
-
-    return FileResponse(
-        path=str(file_path),
-        filename="audio_files.zip",
-        media_type="application/zip"
-    )
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/")
-async def root():
+        except Exception:
+            pass
 
     return {
-
-        "name": APP_NAME,
-
-        "status": "online",
-
-        "edge_tts": True,
-
-        "ffmpeg": ffmpeg_exists(),
-
-        "formats": [
-            "mp3",
-            "wav"
-        ],
-
-        "bitrates": [
-            56,
-            64,
-            96,
-            128,
-            192,
-            256,
-            320
-        ]
+        "success": True,
+        "removed_files": removed
     }
 
 
 # ============================================================
-# RUN
+# Run
 # ============================================================
 
 if __name__ == "__main__":
 
     import uvicorn
 
+    port = int(
+        os.environ.get(
+            "PORT",
+            "8000"
+        )
+    )
+
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=int(
-            os.environ.get(
-                "PORT",
-                8000
-            )
-        )
+        port=port
     )
