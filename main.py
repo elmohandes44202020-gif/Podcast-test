@@ -1,511 +1,1032 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import edge_tts
+import asyncio
+import io
 import os
-import shutil
+import re
 import tempfile
-import traceback
+import uuid
+from typing import List, Optional
 
-# ============================================================
-# APP
-# ============================================================
+import av
+import edge_tts
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response, JSONResponse
+from pydantic import BaseModel, Field
+
 
 app = FastAPI(
     title="Edge TTS Audio Processing Server",
-    version="2.0.0"
+    description="Edge-TTS + PyAV Audio Processing Server",
+    version="1.0.0"
 )
 
 
-# ============================================================
-# PYAV TEST
-# ============================================================
+# =========================================================
+# CONFIG
+# =========================================================
 
-def check_pyav():
-    """
-    اختبار حقيقي لتحميل PyAV.
-    لا يعتمد على وجود أمر ffmpeg في النظام.
-    """
+SUPPORTED_FORMATS = ["mp3", "wav"]
+
+SUPPORTED_BITRATES = [
+    56,
+    64,
+    96,
+    128,
+    192,
+    256,
+    320
+]
+
+SUPPORTED_SAMPLE_RATES = [
+    8000,
+    16000,
+    22050,
+    24000,
+    32000,
+    44100,
+    48000
+]
+
+
+# =========================================================
+# MODELS
+# =========================================================
+
+class TTSRequest(BaseModel):
+
+    text: str = Field(
+        ...,
+        min_length=1,
+        description="Text to convert to speech"
+    )
+
+    voice: str = "ar-EG-SalmaNeural"
+
+    rate: str = "+0%"
+
+    pitch: str = "+0Hz"
+
+    output_format: str = "mp3"
+
+    bitrate: int = 128
+
+    sample_rate: int = 24000
+
+    channels: int = 1
+
+
+class PodcastSegment(BaseModel):
+
+    text: str = Field(
+        ...,
+        min_length=1
+    )
+
+    voice: str = "ar-EG-SalmaNeural"
+
+    rate: str = "+0%"
+
+    pitch: str = "+0Hz"
+
+
+class PodcastRequest(BaseModel):
+
+    segments: List[PodcastSegment]
+
+    output_format: str = "mp3"
+
+    bitrate: int = 128
+
+    sample_rate: int = 24000
+
+    channels: int = 1
+
+
+# =========================================================
+# TEXT HELPERS
+# =========================================================
+
+def clean_text(text: str) -> str:
+
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text
+
+
+def validate_audio_settings(
+    output_format: str,
+    bitrate: int,
+    sample_rate: int,
+    channels: int
+):
+
+    output_format = output_format.lower()
+
+    if output_format not in SUPPORTED_FORMATS:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format. Supported formats: {SUPPORTED_FORMATS}"
+        )
+
+    if bitrate not in SUPPORTED_BITRATES:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported bitrate. Supported bitrates: {SUPPORTED_BITRATES}"
+        )
+
+    if sample_rate not in SUPPORTED_SAMPLE_RATES:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported sample rate. Supported sample rates: {SUPPORTED_SAMPLE_RATES}"
+        )
+
+    if channels not in [1, 2]:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Channels must be 1 (Mono) or 2 (Stereo)"
+        )
+
+
+# =========================================================
+# EDGE TTS
+# =========================================================
+
+async def generate_tts_audio(
+    text: str,
+    voice: str,
+    rate: str,
+    pitch: str
+) -> bytes:
+
+    text = clean_text(text)
+
+    if not text:
+
+        raise ValueError(
+            "Text is empty"
+        )
+
+    communicate = edge_tts.Communicate(
+        text=text,
+        voice=voice,
+        rate=rate,
+        pitch=pitch
+    )
+
+    audio_buffer = io.BytesIO()
+
+    async for chunk in communicate.stream():
+
+        if chunk["type"] == "audio":
+
+            audio_buffer.write(
+                chunk["data"]
+            )
+
+    audio_data = audio_buffer.getvalue()
+
+    if not audio_data:
+
+        raise RuntimeError(
+            "Edge-TTS returned empty audio"
+        )
+
+    return audio_data
+
+
+# =========================================================
+# PYAV AUDIO CONVERSION
+# =========================================================
+
+def convert_audio_with_pyav(
+    input_audio: bytes,
+    output_format: str,
+    bitrate: int,
+    sample_rate: int,
+    channels: int
+) -> bytes:
+
+    output_format = output_format.lower()
+
+    input_buffer = io.BytesIO(
+        input_audio
+    )
+
+    output_buffer = io.BytesIO()
+
+    input_container = None
+    output_container = None
+
     try:
-        import av
 
-        return {
-            "installed": True,
-            "version": av.__version__,
-            "status": "working"
-        }
+        # ================================================
+        # OPEN INPUT
+        # ================================================
 
-    except Exception as e:
-        return {
-            "installed": False,
-            "version": None,
-            "status": "error",
-            "error": str(e)
-        }
+        input_container = av.open(
+            input_buffer,
+            mode="r"
+        )
+
+        # ================================================
+        # OPEN OUTPUT
+        # ================================================
+
+        output_container = av.open(
+            output_buffer,
+            mode="w",
+            format=output_format
+        )
+
+        # ================================================
+        # FIND AUDIO STREAM
+        # ================================================
+
+        input_stream = None
+
+        for stream in input_container.streams:
+
+            if stream.type == "audio":
+
+                input_stream = stream
+                break
+
+        if input_stream is None:
+
+            raise RuntimeError(
+                "No audio stream found"
+            )
+
+        # ================================================
+        # CODEC
+        # ================================================
+
+        if output_format == "mp3":
+
+            codec_name = "mp3"
+
+        elif output_format == "wav":
+
+            codec_name = "pcm_s16le"
+
+        else:
+
+            raise RuntimeError(
+                "Unsupported output format"
+            )
+
+        # ================================================
+        # OUTPUT STREAM
+        # ================================================
+
+        output_stream = output_container.add_stream(
+            codec_name,
+            rate=sample_rate
+        )
+
+        # ================================================
+        # CHANNEL LAYOUT
+        # ================================================
+
+        if channels == 1:
+
+            output_stream.layout = "mono"
+
+        else:
+
+            output_stream.layout = "stereo"
+
+        # ================================================
+        # BITRATE
+        # ================================================
+
+        if output_format == "mp3":
+
+            output_stream.bit_rate = (
+                bitrate * 1000
+            )
+
+        # ================================================
+        # RESAMPLER
+        # ================================================
+
+        target_layout = (
+            "mono"
+            if channels == 1
+            else "stereo"
+        )
+
+        resampler = av.audio.resampler.AudioResampler(
+            format="s16",
+            layout=target_layout,
+            rate=sample_rate
+        )
+
+        # ================================================
+        # DECODE
+        # ================================================
+
+        for frame in input_container.decode(
+            input_stream
+        ):
+
+            resampled_frames = resampler.resample(
+                frame
+            )
+
+            if resampled_frames is None:
+
+                continue
+
+            if not isinstance(
+                resampled_frames,
+                list
+            ):
+
+                resampled_frames = [
+                    resampled_frames
+                ]
+
+            for resampled_frame in resampled_frames:
+
+                packets = output_stream.encode(
+                    resampled_frame
+                )
+
+                for packet in packets:
+
+                    output_container.mux(
+                        packet
+                    )
+
+        # ================================================
+        # FLUSH RESAMPLER
+        # ================================================
+
+        flushed_frames = resampler.resample(
+            None
+        )
+
+        if flushed_frames:
+
+            if not isinstance(
+                flushed_frames,
+                list
+            ):
+
+                flushed_frames = [
+                    flushed_frames
+                ]
+
+            for frame in flushed_frames:
+
+                packets = output_stream.encode(
+                    frame
+                )
+
+                for packet in packets:
+
+                    output_container.mux(
+                        packet
+                    )
+
+        # ================================================
+        # FLUSH ENCODER
+        # ================================================
+
+        packets = output_stream.encode(
+            None
+        )
+
+        for packet in packets:
+
+            output_container.mux(
+                packet
+            )
+
+        # ================================================
+        # CLOSE OUTPUT
+        # ================================================
+
+        output_container.close()
+
+        output_container = None
+
+        return output_buffer.getvalue()
+
+    finally:
+
+        if input_container:
+
+            try:
+
+                input_container.close()
+
+            except Exception:
+
+                pass
+
+        if output_container:
+
+            try:
+
+                output_container.close()
+
+            except Exception:
+
+                pass
 
 
-# ============================================================
-# EDGE TTS TEST
-# ============================================================
+# =========================================================
+# MULTIPLE AUDIO CONCATENATION
+# =========================================================
 
-def check_edge_tts():
+def merge_audio_files(
+    audio_files: List[bytes],
+    output_format: str,
+    bitrate: int,
+    sample_rate: int,
+    channels: int
+) -> bytes:
+
+    if not audio_files:
+
+        raise RuntimeError(
+            "No audio files to merge"
+        )
+
+    output_format = output_format.lower()
+
+    output_buffer = io.BytesIO()
+
+    output_container = None
+
     try:
-        version = getattr(edge_tts, "__version__", "unknown")
 
-        return {
-            "installed": True,
-            "version": version,
-            "status": "working"
-        }
+        # ================================================
+        # OPEN OUTPUT
+        # ================================================
 
-    except Exception as e:
-        return {
-            "installed": False,
-            "version": None,
-            "status": "error",
-            "error": str(e)
-        }
+        output_container = av.open(
+            output_buffer,
+            mode="w",
+            format=output_format
+        )
+
+        # ================================================
+        # SELECT CODEC
+        # ================================================
+
+        if output_format == "mp3":
+
+            codec_name = "mp3"
+
+        elif output_format == "wav":
+
+            codec_name = "pcm_s16le"
+
+        else:
+
+            raise RuntimeError(
+                "Unsupported output format"
+            )
+
+        # ================================================
+        # CREATE OUTPUT STREAM
+        # ================================================
+
+        output_stream = output_container.add_stream(
+            codec_name,
+            rate=sample_rate
+        )
+
+        if channels == 1:
+
+            output_stream.layout = "mono"
+
+        else:
+
+            output_stream.layout = "stereo"
+
+        if output_format == "mp3":
+
+            output_stream.bit_rate = (
+                bitrate * 1000
+            )
+
+        target_layout = (
+            "mono"
+            if channels == 1
+            else "stereo"
+        )
+
+        # ================================================
+        # PROCESS EVERY AUDIO FILE
+        # ================================================
+
+        for audio_data in audio_files:
+
+            input_buffer = io.BytesIO(
+                audio_data
+            )
+
+            input_container = None
+
+            try:
+
+                input_container = av.open(
+                    input_buffer,
+                    mode="r"
+                )
+
+                input_stream = None
+
+                for stream in input_container.streams:
+
+                    if stream.type == "audio":
+
+                        input_stream = stream
+                        break
+
+                if input_stream is None:
+
+                    continue
+
+                # ========================================
+                # RESAMPLER
+                # ========================================
+
+                resampler = av.audio.resampler.AudioResampler(
+                    format="s16",
+                    layout=target_layout,
+                    rate=sample_rate
+                )
+
+                # ========================================
+                # DECODE AUDIO
+                # ========================================
+
+                for frame in input_container.decode(
+                    input_stream
+                ):
+
+                    frames = resampler.resample(
+                        frame
+                    )
+
+                    if frames is None:
+
+                        continue
+
+                    if not isinstance(
+                        frames,
+                        list
+                    ):
+
+                        frames = [frames]
+
+                    for processed_frame in frames:
+
+                        packets = output_stream.encode(
+                            processed_frame
+                        )
+
+                        for packet in packets:
+
+                            output_container.mux(
+                                packet
+                            )
+
+                # ========================================
+                # FLUSH RESAMPLER
+                # ========================================
+
+                frames = resampler.resample(
+                    None
+                )
+
+                if frames:
+
+                    if not isinstance(
+                        frames,
+                        list
+                    ):
+
+                        frames = [frames]
+
+                    for processed_frame in frames:
+
+                        packets = output_stream.encode(
+                            processed_frame
+                        )
+
+                        for packet in packets:
+
+                            output_container.mux(
+                                packet
+                            )
+
+            finally:
+
+                if input_container:
+
+                    try:
+
+                        input_container.close()
+
+                    except Exception:
+
+                        pass
+
+        # ================================================
+        # FLUSH ENCODER
+        # ================================================
+
+        packets = output_stream.encode(
+            None
+        )
+
+        for packet in packets:
+
+            output_container.mux(
+                packet
+            )
+
+        output_container.close()
+
+        output_container = None
+
+        final_audio = output_buffer.getvalue()
+
+        if not final_audio:
+
+            raise RuntimeError(
+                "Final merged audio is empty"
+            )
+
+        return final_audio
+
+    finally:
+
+        if output_container:
+
+            try:
+
+                output_container.close()
+
+            except Exception:
+
+                pass
 
 
-# ============================================================
-# FFMPEG COMMAND TEST
-# ============================================================
-
-def check_ffmpeg_command():
-    """
-    هذا الاختبار يبحث عن برنامج ffmpeg كأمر نظام.
-    
-    ملاحظة:
-    وجود PyAV لا يعني أن أمر ffmpeg نفسه موجود.
-    """
-
-    path = shutil.which("ffmpeg")
-
-    return {
-        "installed": path is not None,
-        "path": path
-    }
-
-
-# ============================================================
-# ROOT
-# ============================================================
+# =========================================================
+# HOME
+# =========================================================
 
 @app.get("/")
-async def root():
-
-    pyav = check_pyav()
-    edge = check_edge_tts()
-    ffmpeg = check_ffmpeg_command()
+async def home():
 
     return {
         "name": "Edge TTS Audio Processing Server",
 
         "status": "online",
 
-        "edge_tts": edge["installed"],
+        "edge_tts": True,
 
-        "edge_tts_version": edge["version"],
+        "pyav": True,
 
-        "pyav": pyav["installed"],
+        "ffmpeg_command": False,
 
-        "pyav_version": pyav["version"],
+        "formats": SUPPORTED_FORMATS,
 
-        "pyav_status": pyav["status"],
+        "bitrates": SUPPORTED_BITRATES,
 
-        "ffmpeg_command": ffmpeg["installed"],
+        "sample_rates": SUPPORTED_SAMPLE_RATES,
 
-        "ffmpeg_path": ffmpeg["path"],
-
-        "formats": [
-            "mp3",
-            "wav"
-        ],
-
-        "bitrates": [
-            56,
-            64,
-            96,
-            128,
-            192,
-            256,
-            320
-        ],
+        "channels": {
+            "1": "Mono",
+            "2": "Stereo"
+        },
 
         "features": [
+
             "Edge-TTS",
+
             "PyAV",
+
             "MP3",
+
             "WAV",
+
             "Bitrate",
+
             "Sample Rate",
+
             "Mono/Stereo",
+
             "Podcast",
+
             "Multi Speaker",
+
             "Audio Concatenation"
-        ]
-    }
+        ],
 
+        "endpoints": {
 
-# ============================================================
-# PYAV TEST ENDPOINT
-# ============================================================
+            "tts": "/tts",
 
-@app.get("/pyav-test")
-async def pyav_test():
+            "podcast": "/podcast",
 
-    result = check_pyav()
-
-    if not result["installed"]:
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "pyav": False,
-                "status": "failed",
-                "error": result.get("error")
-            }
-        )
-
-    return {
-        "pyav": True,
-        "version": result["version"],
-        "status": "PyAV is working correctly"
-    }
-
-
-# ============================================================
-# EDGE TTS TEST ENDPOINT
-# ============================================================
-
-@app.get("/edge-test")
-async def edge_test():
-
-    result = check_edge_tts()
-
-    return {
-        "edge_tts": result["installed"],
-        "version": result["version"],
-        "status": result["status"]
-    }
-
-
-# ============================================================
-# FFMPEG COMMAND TEST
-# ============================================================
-
-@app.get("/ffmpeg-test")
-async def ffmpeg_test():
-
-    result = check_ffmpeg_command()
-
-    return {
-        "ffmpeg_command": result["installed"],
-        "path": result["path"],
-        "note": (
-            "This only checks for the ffmpeg executable. "
-            "PyAV does not require the executable."
-        )
-    }
-
-
-# ============================================================
-# PYAV AUDIO CREATION TEST
-# ============================================================
-
-@app.get("/pyav-audio-test")
-async def pyav_audio_test():
-
-    """
-    اختبار أقوى من مجرد import av.
-
-    يقوم بإنشاء WAV حقيقي باستخدام PyAV
-    داخل ملف مؤقت.
-
-    لا يستخدم ffmpeg command.
-    """
-
-    try:
-
-        import av
-        import math
-        import struct
-
-        sample_rate = 44100
-        duration = 1.0
-        frequency = 440.0
-
-        samples = int(sample_rate * duration)
-
-        temp_dir = tempfile.mkdtemp(prefix="pyav_test_")
-
-        wav_path = os.path.join(
-            temp_dir,
-            "pyav_test.wav"
-        )
-
-        # ----------------------------------------------------
-        # إنشاء ملف WAV
-        # ----------------------------------------------------
-
-        container = av.open(
-            wav_path,
-            mode="w",
-            format="wav"
-        )
-
-        stream = container.add_stream(
-            "pcm_s16le",
-            rate=sample_rate
-        )
-
-        stream.layout = "mono"
-
-        # ----------------------------------------------------
-        # إنشاء صوت Sine Wave
-        # ----------------------------------------------------
-
-        pcm_data = bytearray()
-
-        for i in range(samples):
-
-            value = int(
-                16000 *
-                math.sin(
-                    2.0 *
-                    math.pi *
-                    frequency *
-                    i /
-                    sample_rate
-                )
-            )
-
-            pcm_data.extend(
-                struct.pack(
-                    "<h",
-                    value
-                )
-            )
-
-        # ----------------------------------------------------
-        # تحويل البيانات إلى AudioFrame
-        # ----------------------------------------------------
-
-        frame = av.AudioFrame(
-            format="s16",
-            layout="mono",
-            samples=samples
-        )
-
-        frame.sample_rate = sample_rate
-
-        frame.planes[0].update(
-            bytes(pcm_data)
-        )
-
-        # ----------------------------------------------------
-        # Encoding
-        # ----------------------------------------------------
-
-        for packet in stream.encode(frame):
-
-            container.mux(packet)
-
-        # Flush
-
-        for packet in stream.encode():
-
-            container.mux(packet)
-
-        container.close()
-
-        # ----------------------------------------------------
-        # التحقق من الملف
-        # ----------------------------------------------------
-
-        file_exists = os.path.exists(wav_path)
-
-        file_size = (
-            os.path.getsize(wav_path)
-            if file_exists
-            else 0
-        )
-
-        # ----------------------------------------------------
-        # محاولة فتح الملف مرة أخرى
-        # ----------------------------------------------------
-
-        verify = None
-
-        if file_exists:
-
-            verify_container = av.open(
-                wav_path,
-                mode="r"
-            )
-
-            verify_stream = (
-                verify_container.streams.audio[0]
-                if verify_container.streams.audio
-                else None
-            )
-
-            verify = {
-                "audio_stream_found": verify_stream is not None,
-                "format": (
-                    str(verify_container.format.name)
-                    if verify_container.format
-                    else None
-                ),
-                "sample_rate": (
-                    verify_stream.rate
-                    if verify_stream
-                    else None
-                )
-            }
-
-            verify_container.close()
-
-        # ----------------------------------------------------
-        # Cleanup
-        # ----------------------------------------------------
-
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True
-        )
-
-        return {
-            "success": True,
-
-            "pyav": True,
-
-            "pyav_version": av.__version__,
-
-            "test": "WAV creation",
-
-            "format": "wav",
-
-            "sample_rate": sample_rate,
-
-            "channels": 1,
-
-            "duration_seconds": duration,
-
-            "file_created": file_exists,
-
-            "file_size_bytes": file_size,
-
-            "verification": verify,
-
-            "message": (
-                "PyAV successfully created and "
-                "re-opened a WAV audio file."
-            )
+            "health": "/health"
         }
-
-    except Exception as e:
-
-        traceback.print_exc()
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "pyav": False,
-                "test": "WAV creation",
-                "error": str(e),
-                "traceback": traceback.format_exc()
-            }
-        )
+    }
 
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
+# =========================================================
+# HEALTH
+# =========================================================
 
 @app.get("/health")
 async def health():
 
-    pyav = check_pyav()
-    edge = check_edge_tts()
-
     return {
-        "status": "healthy",
+        "status": "ok",
 
-        "services": {
-            "fastapi": True,
+        "edge_tts": True,
 
-            "edge_tts": edge["installed"],
-
-            "pyav": pyav["installed"]
-        },
-
-        "versions": {
-            "edge_tts": edge["version"],
-
-            "pyav": pyav["version"]
-        }
+        "pyav": True
     }
 
 
-# ============================================================
-# STARTUP
-# ============================================================
+# =========================================================
+# TTS ENDPOINT
+# =========================================================
 
-@app.on_event("startup")
-async def startup_event():
+@app.post("/tts")
+async def tts(
+    request: TTSRequest
+):
 
-    print("=" * 60)
-    print("Edge TTS Audio Processing Server")
-    print("=" * 60)
-
-    # Edge TTS
-    edge = check_edge_tts()
-
-    print(
-        "Edge-TTS:",
-        edge["installed"],
-        edge["version"]
+    validate_audio_settings(
+        request.output_format,
+        request.bitrate,
+        request.sample_rate,
+        request.channels
     )
 
-    # PyAV
-    pyav = check_pyav()
+    try:
 
-    print(
-        "PyAV:",
-        pyav["installed"],
-        pyav["version"]
-    )
+        # ================================================
+        # GENERATE EDGE AUDIO
+        # ================================================
 
-    # ffmpeg executable
-    ffmpeg = check_ffmpeg_command()
+        original_audio = await generate_tts_audio(
 
-    print(
-        "FFmpeg executable:",
-        ffmpeg["installed"],
-        ffmpeg["path"]
-    )
+            text=request.text,
 
-    print("=" * 60)
+            voice=request.voice,
 
+            rate=request.rate,
 
-# ============================================================
-# MAIN
-# ============================================================
-
-if __name__ == "__main__":
-
-    import uvicorn
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            "8000"
+            pitch=request.pitch
         )
+
+        # ================================================
+        # CONVERT USING PYAV
+        # ================================================
+
+        final_audio = convert_audio_with_pyav(
+
+            input_audio=original_audio,
+
+            output_format=request.output_format,
+
+            bitrate=request.bitrate,
+
+            sample_rate=request.sample_rate,
+
+            channels=request.channels
+        )
+
+        # ================================================
+        # RESPONSE
+        # ================================================
+
+        if request.output_format == "mp3":
+
+            media_type = "audio/mpeg"
+
+        else:
+
+            media_type = "audio/wav"
+
+        filename = (
+            f"edge_tts_{uuid.uuid4().hex[:8]}"
+            f".{request.output_format}"
+        )
+
+        return Response(
+
+            content=final_audio,
+
+            media_type=media_type,
+
+            headers={
+
+                "Content-Disposition":
+                    f'attachment; filename="{filename}"',
+
+                "X-Audio-Format":
+                    request.output_format,
+
+                "X-Bitrate":
+                    str(request.bitrate),
+
+                "X-Sample-Rate":
+                    str(request.sample_rate),
+
+                "X-Channels":
+                    str(request.channels)
+            }
+        )
+
+    except Exception as error:
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=str(error)
+        )
+
+
+# =========================================================
+# PODCAST ENDPOINT
+# =========================================================
+
+@app.post("/podcast")
+async def podcast(
+    request: PodcastRequest
+):
+
+    if not request.segments:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="Podcast must contain at least one segment"
+        )
+
+    validate_audio_settings(
+
+        request.output_format,
+
+        request.bitrate,
+
+        request.sample_rate,
+
+        request.channels
     )
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port
-    )
+    try:
+
+        audio_files = []
+
+        # ================================================
+        # GENERATE EVERY SEGMENT
+        # ================================================
+
+        for index, segment in enumerate(
+            request.segments
+        ):
+
+            audio_data = await generate_tts_audio(
+
+                text=segment.text,
+
+                voice=segment.voice,
+
+                rate=segment.rate,
+
+                pitch=segment.pitch
+            )
+
+            audio_files.append(
+                audio_data
+            )
+
+        # ================================================
+        # MERGE ALL SEGMENTS
+        # ================================================
+
+        final_audio = merge_audio_files(
+
+            audio_files=audio_files,
+
+            output_format=request.output_format,
+
+            bitrate=request.bitrate,
+
+            sample_rate=request.sample_rate,
+
+            channels=request.channels
+        )
+
+        # ================================================
+        # RESPONSE
+        # ================================================
+
+        if request.output_format == "mp3":
+
+            media_type = "audio/mpeg"
+
+        else:
+
+            media_type = "audio/wav"
+
+        filename = (
+            f"podcast_{uuid.uuid4().hex[:8]}"
+            f".{request.output_format}"
+        )
+
+        return Response(
+
+            content=final_audio,
+
+            media_type=media_type,
+
+            headers={
+
+                "Content-Disposition":
+                    f'attachment; filename="{filename}"',
+
+                "X-Segments":
+                    str(len(request.segments)),
+
+                "X-Audio-Format":
+                    request.output_format,
+
+                "X-Bitrate":
+                    str(request.bitrate),
+
+                "X-Sample-Rate":
+                    str(request.sample_rate),
+
+                "X-Channels":
+                    str(request.channels)
+            }
+        )
+
+    except Exception as error:
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=str(error)
+        )
+
+
+# =========================================================
+# SERVER INFO
+# =========================================================
+
+@app.get("/info")
+async def info():
+
+    return {
+
+        "server": "Edge TTS Audio Processing Server",
+
+        "edge_tts": True,
+
+        "pyav": True,
+
+        "ffmpeg_command": False,
+
+        "audio_processing": True,
+
+        "podcast_support": True,
+
+        "multi_speaker": True,
+
+        "formats": SUPPORTED_FORMATS,
+
+        "bitrates": SUPPORTED_BITRATES,
+
+        "sample_rates": SUPPORTED_SAMPLE_RATES
+    }
