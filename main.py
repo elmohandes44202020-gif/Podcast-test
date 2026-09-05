@@ -1,300 +1,139 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from pathlib import Path
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 import edge_tts
-import asyncio
-import subprocess
-import tempfile
-import uuid
 import os
 import shutil
-import re
+import tempfile
+import traceback
+
+# ============================================================
+# APP
+# ============================================================
 
 app = FastAPI(
     title="Edge TTS Audio Processing Server",
     version="2.0.0"
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "outputs"
-TEMP_DIR = BASE_DIR / "temp"
-
-OUTPUT_DIR.mkdir(exist_ok=True)
-TEMP_DIR.mkdir(exist_ok=True)
-
 
 # ============================================================
-# Models
+# PYAV TEST
 # ============================================================
 
-class GenerateRequest(BaseModel):
-    text: str = Field(..., min_length=1)
-    voice: str = "ar-SA-HamedNeural"
-    rate: str = "+0%"
-    pitch: str = "+0Hz"
-    output_format: str = "mp3"
-    bitrate: str = "192k"
-    sample_rate: int = 44100
-    channels: int = 2
-
-
-class PodcastSegment(BaseModel):
-    speaker: str
-    text: str = Field(..., min_length=1)
-
-
-class PodcastRequest(BaseModel):
-    segments: list[PodcastSegment]
-
-    speaker_voices: dict[str, str] = {
-        "speaker1": "ar-SA-HamedNeural",
-        "speaker2": "ar-SA-ZariyahNeural"
-    }
-
-    speaker_rates: dict[str, str] = {}
-    speaker_pitches: dict[str, str] = {}
-
-    output_format: str = "mp3"
-    bitrate: str = "192k"
-    sample_rate: int = 44100
-    channels: int = 2
-
-    silence_ms: int = 300
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def ffmpeg_path():
-    return shutil.which("ffmpeg")
-
-
-def validate_format(fmt: str):
-    fmt = fmt.lower()
-
-    if fmt not in ("mp3", "wav"):
-        raise HTTPException(
-            status_code=400,
-            detail="output_format must be mp3 or wav"
-        )
-
-    return fmt
-
-
-def validate_audio_settings(sample_rate: int, channels: int):
-    allowed_rates = {
-        8000,
-        16000,
-        22050,
-        24000,
-        32000,
-        44100,
-        48000
-    }
-
-    if sample_rate not in allowed_rates:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported sample_rate. Allowed: {sorted(allowed_rates)}"
-        )
-
-    if channels not in (1, 2):
-        raise HTTPException(
-            status_code=400,
-            detail="channels must be 1 or 2"
-        )
-
-
-def safe_filename(name: str):
-    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
-    name = name.strip()
-
-    if not name:
-        name = "audio"
-
-    return name
-
-
-# ============================================================
-# Edge-TTS
-# ============================================================
-
-async def generate_tts(
-    text: str,
-    voice: str,
-    rate: str,
-    pitch: str,
-    output_file: Path
-):
-    communicate = edge_tts.Communicate(
-        text=text,
-        voice=voice,
-        rate=rate,
-        pitch=pitch
-    )
-
-    with open(output_file, "wb") as f:
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                f.write(chunk["data"])
-
-
-# ============================================================
-# FFmpeg processing
-# ============================================================
-
-def convert_audio(
-    input_file: Path,
-    output_file: Path,
-    output_format: str,
-    bitrate: str,
-    sample_rate: int,
-    channels: int
-):
-    if not ffmpeg_path():
-        raise RuntimeError("FFmpeg is not installed on the server.")
-
-    command = [
-        ffmpeg_path(),
-        "-y",
-        "-i",
-        str(input_file),
-        "-ar",
-        str(sample_rate),
-        "-ac",
-        str(channels)
-    ]
-
-    if output_format == "mp3":
-        command += [
-            "-codec:a",
-            "libmp3lame",
-            "-b:a",
-            bitrate
-        ]
-
-    elif output_format == "wav":
-        command += [
-            "-codec:a",
-            "pcm_s16le"
-        ]
-
-    command.append(str(output_file))
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "FFmpeg conversion failed:\n" + result.stderr[-4000:]
-        )
-
-
-def create_silence(
-    output_file: Path,
-    milliseconds: int,
-    sample_rate: int,
-    channels: int
-):
-    if milliseconds <= 0:
-        return
-
-    duration = milliseconds / 1000
-
-    command = [
-        ffmpeg_path(),
-        "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        f"anullsrc=r={sample_rate}:cl={'mono' if channels == 1 else 'stereo'}",
-        "-t",
-        str(duration),
-        "-c:a",
-        "pcm_s16le",
-        str(output_file)
-    ]
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Could not create silence:\n" + result.stderr[-4000:]
-        )
-
-
-def concat_audio(
-    files: list[Path],
-    output_file: Path
-):
-    if not files:
-        raise RuntimeError("No audio files to concatenate.")
-
-    list_file = output_file.parent / f"{uuid.uuid4().hex}_concat.txt"
-
+def check_pyav():
+    """
+    اختبار حقيقي لتحميل PyAV.
+    لا يعتمد على وجود أمر ffmpeg في النظام.
+    """
     try:
-        with open(list_file, "w", encoding="utf-8") as f:
-            for file in files:
-                path = str(file.resolve())
-                path = path.replace("'", "'\\''")
-                f.write(f"file '{path}'\n")
+        import av
 
-        command = [
-            ffmpeg_path(),
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_file),
-            "-c",
-            "copy",
-            str(output_file)
-        ]
+        return {
+            "installed": True,
+            "version": av.__version__,
+            "status": "working"
+        }
 
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                "FFmpeg concat failed:\n" + result.stderr[-4000:]
-            )
-
-    finally:
-        list_file.unlink(missing_ok=True)
+    except Exception as e:
+        return {
+            "installed": False,
+            "version": None,
+            "status": "error",
+            "error": str(e)
+        }
 
 
 # ============================================================
-# Health / Root
+# EDGE TTS TEST
+# ============================================================
+
+def check_edge_tts():
+    try:
+        version = getattr(edge_tts, "__version__", "unknown")
+
+        return {
+            "installed": True,
+            "version": version,
+            "status": "working"
+        }
+
+    except Exception as e:
+        return {
+            "installed": False,
+            "version": None,
+            "status": "error",
+            "error": str(e)
+        }
+
+
+# ============================================================
+# FFMPEG COMMAND TEST
+# ============================================================
+
+def check_ffmpeg_command():
+    """
+    هذا الاختبار يبحث عن برنامج ffmpeg كأمر نظام.
+    
+    ملاحظة:
+    وجود PyAV لا يعني أن أمر ffmpeg نفسه موجود.
+    """
+
+    path = shutil.which("ffmpeg")
+
+    return {
+        "installed": path is not None,
+        "path": path
+    }
+
+
+# ============================================================
+# ROOT
 # ============================================================
 
 @app.get("/")
 async def root():
+
+    pyav = check_pyav()
+    edge = check_edge_tts()
+    ffmpeg = check_ffmpeg_command()
+
     return {
         "name": "Edge TTS Audio Processing Server",
+
         "status": "online",
-        "edge_tts": True,
-        "ffmpeg": ffmpeg_path() is not None,
-        "formats": ["mp3", "wav"],
-        "bitrates": [56, 64, 96, 128, 192, 256, 320],
+
+        "edge_tts": edge["installed"],
+
+        "edge_tts_version": edge["version"],
+
+        "pyav": pyav["installed"],
+
+        "pyav_version": pyav["version"],
+
+        "pyav_status": pyav["status"],
+
+        "ffmpeg_command": ffmpeg["installed"],
+
+        "ffmpeg_path": ffmpeg["path"],
+
+        "formats": [
+            "mp3",
+            "wav"
+        ],
+
+        "bitrates": [
+            56,
+            64,
+            96,
+            128,
+            192,
+            256,
+            320
+        ],
+
         "features": [
             "Edge-TTS",
+            "PyAV",
             "MP3",
             "WAV",
             "Bitrate",
@@ -308,356 +147,350 @@ async def root():
 
 
 # ============================================================
-# FFmpeg status
+# PYAV TEST ENDPOINT
 # ============================================================
 
-@app.get("/ffmpeg")
-async def ffmpeg_status():
+@app.get("/pyav-test")
+async def pyav_test():
 
-    path = ffmpeg_path()
+    result = check_pyav()
 
-    if not path:
-        return {
-            "installed": False,
-            "message": "FFmpeg is not installed."
-        }
+    if not result["installed"]:
 
-    try:
-        result = subprocess.run(
-            [path, "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        first_line = result.stdout.splitlines()[0] \
-            if result.stdout else "Unknown"
-
-        return {
-            "installed": True,
-            "path": path,
-            "version": first_line
-        }
-
-    except Exception as e:
-        return {
-            "installed": True,
-            "error": str(e)
-        }
-
-
-# ============================================================
-# Normal TTS
-# ============================================================
-
-@app.post("/generate")
-async def generate_audio(request: GenerateRequest):
-
-    validate_format(request.output_format)
-
-    validate_audio_settings(
-        request.sample_rate,
-        request.channels
-    )
-
-    if not ffmpeg_path():
-        raise HTTPException(
+        return JSONResponse(
             status_code=500,
-            detail="FFmpeg is not installed on the server."
+            content={
+                "pyav": False,
+                "status": "failed",
+                "error": result.get("error")
+            }
         )
-
-    job_id = uuid.uuid4().hex
-
-    temp_mp3 = TEMP_DIR / f"{job_id}.mp3"
-
-    filename = safe_filename(f"audio_{job_id}")
-
-    final_file = OUTPUT_DIR / (
-        f"{filename}.{request.output_format}"
-    )
-
-    try:
-
-        await generate_tts(
-            request.text,
-            request.voice,
-            request.rate,
-            request.pitch,
-            temp_mp3
-        )
-
-        convert_audio(
-            temp_mp3,
-            final_file,
-            request.output_format,
-            request.bitrate,
-            request.sample_rate,
-            request.channels
-        )
-
-        return {
-            "success": True,
-            "type": "single",
-            "filename": final_file.name,
-            "download_url": f"/download/{final_file.name}"
-        }
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-    finally:
-
-        temp_mp3.unlink(missing_ok=True)
-
-
-# ============================================================
-# Podcast
-# ============================================================
-
-@app.post("/podcast")
-async def generate_podcast(request: PodcastRequest):
-
-    if not request.segments:
-        raise HTTPException(
-            status_code=400,
-            detail="Podcast must contain at least one segment."
-        )
-
-    validate_format(request.output_format)
-
-    validate_audio_settings(
-        request.sample_rate,
-        request.channels
-    )
-
-    if not ffmpeg_path():
-        raise HTTPException(
-            status_code=500,
-            detail="FFmpeg is not installed on the server."
-        )
-
-    job_id = uuid.uuid4().hex
-
-    work_dir = TEMP_DIR / f"podcast_{job_id}"
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    generated_files = []
-
-    try:
-
-        # ----------------------------------------------------
-        # Generate every dialogue segment separately
-        # ----------------------------------------------------
-
-        for index, segment in enumerate(request.segments):
-
-            speaker = segment.speaker
-
-            voice = request.speaker_voices.get(
-                speaker,
-                "ar-SA-HamedNeural"
-            )
-
-            rate = request.speaker_rates.get(
-                speaker,
-                "+0%"
-            )
-
-            pitch = request.speaker_pitches.get(
-                speaker,
-                "+0Hz"
-            )
-
-            segment_mp3 = (
-                work_dir /
-                f"{index:06d}_{speaker}.mp3"
-            )
-
-            await generate_tts(
-                segment.text,
-                voice,
-                rate,
-                pitch,
-                segment_mp3
-            )
-
-            generated_files.append(segment_mp3)
-
-            # ------------------------------------------------
-            # Add silence between dialogue segments
-            # ------------------------------------------------
-
-            if (
-                request.silence_ms > 0
-                and index < len(request.segments) - 1
-            ):
-
-                silence_file = (
-                    work_dir /
-                    f"{index:06d}_silence.wav"
-                )
-
-                create_silence(
-                    silence_file,
-                    request.silence_ms,
-                    request.sample_rate,
-                    request.channels
-                )
-
-                generated_files.append(silence_file)
-
-        # ----------------------------------------------------
-        # Normalize everything to same WAV format
-        # ----------------------------------------------------
-
-        normalized_files = []
-
-        for index, file in enumerate(generated_files):
-
-            normalized = (
-                work_dir /
-                f"normalized_{index:06d}.wav"
-            )
-
-            convert_audio(
-                file,
-                normalized,
-                "wav",
-                request.bitrate,
-                request.sample_rate,
-                request.channels
-            )
-
-            normalized_files.append(normalized)
-
-        # ----------------------------------------------------
-        # Concatenate
-        # ----------------------------------------------------
-
-        merged_wav = (
-            work_dir /
-            "podcast_merged.wav"
-        )
-
-        concat_audio(
-            normalized_files,
-            merged_wav
-        )
-
-        # ----------------------------------------------------
-        # Final output
-        # ----------------------------------------------------
-
-        final_name = safe_filename(
-            f"podcast_{job_id}"
-        )
-
-        final_file = OUTPUT_DIR / (
-            f"{final_name}.{request.output_format}"
-        )
-
-        if request.output_format == "wav":
-
-            convert_audio(
-                merged_wav,
-                final_file,
-                "wav",
-                request.bitrate,
-                request.sample_rate,
-                request.channels
-            )
-
-        else:
-
-            convert_audio(
-                merged_wav,
-                final_file,
-                "mp3",
-                request.bitrate,
-                request.sample_rate,
-                request.channels
-            )
-
-        return {
-            "success": True,
-            "type": "podcast",
-            "segments": len(request.segments),
-            "filename": final_file.name,
-            "download_url": f"/download/{final_file.name}"
-        }
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
-        )
-
-    finally:
-
-        shutil.rmtree(
-            work_dir,
-            ignore_errors=True
-        )
-
-
-# ============================================================
-# Download
-# ============================================================
-
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-
-    filename = Path(filename).name
-
-    file_path = OUTPUT_DIR / filename
-
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="File not found."
-        )
-
-    return FileResponse(
-        path=str(file_path),
-        filename=file_path.name,
-        media_type="application/octet-stream"
-    )
-
-
-# ============================================================
-# Cleanup old files
-# ============================================================
-
-@app.post("/cleanup")
-async def cleanup():
-
-    removed = 0
-
-    for file in OUTPUT_DIR.iterdir():
-
-        if not file.is_file():
-            continue
-
-        try:
-            file.unlink()
-            removed += 1
-
-        except Exception:
-            pass
 
     return {
-        "success": True,
-        "removed_files": removed
+        "pyav": True,
+        "version": result["version"],
+        "status": "PyAV is working correctly"
     }
 
 
 # ============================================================
-# Run
+# EDGE TTS TEST ENDPOINT
+# ============================================================
+
+@app.get("/edge-test")
+async def edge_test():
+
+    result = check_edge_tts()
+
+    return {
+        "edge_tts": result["installed"],
+        "version": result["version"],
+        "status": result["status"]
+    }
+
+
+# ============================================================
+# FFMPEG COMMAND TEST
+# ============================================================
+
+@app.get("/ffmpeg-test")
+async def ffmpeg_test():
+
+    result = check_ffmpeg_command()
+
+    return {
+        "ffmpeg_command": result["installed"],
+        "path": result["path"],
+        "note": (
+            "This only checks for the ffmpeg executable. "
+            "PyAV does not require the executable."
+        )
+    }
+
+
+# ============================================================
+# PYAV AUDIO CREATION TEST
+# ============================================================
+
+@app.get("/pyav-audio-test")
+async def pyav_audio_test():
+
+    """
+    اختبار أقوى من مجرد import av.
+
+    يقوم بإنشاء WAV حقيقي باستخدام PyAV
+    داخل ملف مؤقت.
+
+    لا يستخدم ffmpeg command.
+    """
+
+    try:
+
+        import av
+        import math
+        import struct
+
+        sample_rate = 44100
+        duration = 1.0
+        frequency = 440.0
+
+        samples = int(sample_rate * duration)
+
+        temp_dir = tempfile.mkdtemp(prefix="pyav_test_")
+
+        wav_path = os.path.join(
+            temp_dir,
+            "pyav_test.wav"
+        )
+
+        # ----------------------------------------------------
+        # إنشاء ملف WAV
+        # ----------------------------------------------------
+
+        container = av.open(
+            wav_path,
+            mode="w",
+            format="wav"
+        )
+
+        stream = container.add_stream(
+            "pcm_s16le",
+            rate=sample_rate
+        )
+
+        stream.layout = "mono"
+
+        # ----------------------------------------------------
+        # إنشاء صوت Sine Wave
+        # ----------------------------------------------------
+
+        pcm_data = bytearray()
+
+        for i in range(samples):
+
+            value = int(
+                16000 *
+                math.sin(
+                    2.0 *
+                    math.pi *
+                    frequency *
+                    i /
+                    sample_rate
+                )
+            )
+
+            pcm_data.extend(
+                struct.pack(
+                    "<h",
+                    value
+                )
+            )
+
+        # ----------------------------------------------------
+        # تحويل البيانات إلى AudioFrame
+        # ----------------------------------------------------
+
+        frame = av.AudioFrame(
+            format="s16",
+            layout="mono",
+            samples=samples
+        )
+
+        frame.sample_rate = sample_rate
+
+        frame.planes[0].update(
+            bytes(pcm_data)
+        )
+
+        # ----------------------------------------------------
+        # Encoding
+        # ----------------------------------------------------
+
+        for packet in stream.encode(frame):
+
+            container.mux(packet)
+
+        # Flush
+
+        for packet in stream.encode():
+
+            container.mux(packet)
+
+        container.close()
+
+        # ----------------------------------------------------
+        # التحقق من الملف
+        # ----------------------------------------------------
+
+        file_exists = os.path.exists(wav_path)
+
+        file_size = (
+            os.path.getsize(wav_path)
+            if file_exists
+            else 0
+        )
+
+        # ----------------------------------------------------
+        # محاولة فتح الملف مرة أخرى
+        # ----------------------------------------------------
+
+        verify = None
+
+        if file_exists:
+
+            verify_container = av.open(
+                wav_path,
+                mode="r"
+            )
+
+            verify_stream = (
+                verify_container.streams.audio[0]
+                if verify_container.streams.audio
+                else None
+            )
+
+            verify = {
+                "audio_stream_found": verify_stream is not None,
+                "format": (
+                    str(verify_container.format.name)
+                    if verify_container.format
+                    else None
+                ),
+                "sample_rate": (
+                    verify_stream.rate
+                    if verify_stream
+                    else None
+                )
+            }
+
+            verify_container.close()
+
+        # ----------------------------------------------------
+        # Cleanup
+        # ----------------------------------------------------
+
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True
+        )
+
+        return {
+            "success": True,
+
+            "pyav": True,
+
+            "pyav_version": av.__version__,
+
+            "test": "WAV creation",
+
+            "format": "wav",
+
+            "sample_rate": sample_rate,
+
+            "channels": 1,
+
+            "duration_seconds": duration,
+
+            "file_created": file_exists,
+
+            "file_size_bytes": file_size,
+
+            "verification": verify,
+
+            "message": (
+                "PyAV successfully created and "
+                "re-opened a WAV audio file."
+            )
+        }
+
+    except Exception as e:
+
+        traceback.print_exc()
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "pyav": False,
+                "test": "WAV creation",
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
+        )
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+async def health():
+
+    pyav = check_pyav()
+    edge = check_edge_tts()
+
+    return {
+        "status": "healthy",
+
+        "services": {
+            "fastapi": True,
+
+            "edge_tts": edge["installed"],
+
+            "pyav": pyav["installed"]
+        },
+
+        "versions": {
+            "edge_tts": edge["version"],
+
+            "pyav": pyav["version"]
+        }
+    }
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+
+    print("=" * 60)
+    print("Edge TTS Audio Processing Server")
+    print("=" * 60)
+
+    # Edge TTS
+    edge = check_edge_tts()
+
+    print(
+        "Edge-TTS:",
+        edge["installed"],
+        edge["version"]
+    )
+
+    # PyAV
+    pyav = check_pyav()
+
+    print(
+        "PyAV:",
+        pyav["installed"],
+        pyav["version"]
+    )
+
+    # ffmpeg executable
+    ffmpeg = check_ffmpeg_command()
+
+    print(
+        "FFmpeg executable:",
+        ffmpeg["installed"],
+        ffmpeg["path"]
+    )
+
+    print("=" * 60)
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
